@@ -1,8 +1,28 @@
-import { chromium } from '@playwright/test';
+import { test, expect } from '@playwright/test';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const reportPath = path.resolve(process.cwd(), 'jobSearchQA-report.csv');
+test.use({
+  locale: 'en-US',
+  timezoneId: 'UTC',
+});
+
+const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+const reportPath = path.resolve(process.cwd(), `jobSearchQA-report-${timestamp}.csv`);
+
+async function writeCsvWithRetry(filePath, csvContent, retries = 5) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await fs.writeFile(filePath, csvContent, 'utf8');
+      return;
+    } catch (error) {
+      if (error && error.code !== 'EBUSY' || attempt === retries) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+}
 
 function escapeCsv(value) {
   const text = String(value ?? '').replace(/\r?\n/g, ' ');
@@ -14,6 +34,7 @@ function parseRelativeAge(value) {
   const match = text.match(/(\d+(?:\.\d+)?)/);
   const amount = match ? Number(match[1]) : 999999;
 
+  if (text.includes('minute') || text.includes('min')) return amount / 60;
   if (text.includes('hour')) return amount;
   if (text.includes('day')) return amount * 24;
   if (text.includes('week')) return amount * 24 * 7;
@@ -22,36 +43,20 @@ function parseRelativeAge(value) {
   return 999999;
 }
 
-async function main() {
-  const browser = await chromium.launch({ headless: false });
-  const page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
+test('job search QA', async ({ page }) => {
+  test.skip(test.info().project.name !== 'chromium', 'LinkedIn guest search is run once in desktop Chromium');
 
-  await page.goto('https://www.linkedin.com/', { waitUntil: 'domcontentloaded' });
+  await page.goto('https://www.linkedin.com/jobs/search/?keywords=qa%20remote&location=Romania&f_TPR=r86400', {
+    waitUntil: 'domcontentloaded',
+  });
 
-  const jobsButton = page.locator('a[href*="/jobs/"]').filter({ hasText: /Jobs/i }).first();
-  try {
-    await jobsButton.waitFor({ state: 'visible', timeout: 15000 });
-    await jobsButton.click();
-  } catch {
-    await page.goto('https://www.linkedin.com/jobs/', { waitUntil: 'domcontentloaded' });
-  }
-  await page.waitForURL(/linkedin\.com\/jobs\//, { timeout: 20000 });
-
-  const keywordInput = page.locator('input[aria-label="Search job titles or companies"]').first();
-  const locationInput = page.locator('input[aria-label="Location"]').first();
-
-  await keywordInput.fill('qa remote');
-  await locationInput.fill('Romania');
-  await page.keyboard.press('Enter');
-
-  const datePostedFilter = page.getByRole('button', { name: /Date posted/i }).first();
-  if (await datePostedFilter.count()) {
-    await datePostedFilter.click();
+  const acceptCookies = page.getByRole('button', { name: 'Accept', exact: true });
+  if (await acceptCookies.isVisible()) {
+    await acceptCookies.click();
   }
 
-  const past24HoursFilter = page.getByRole('button', { name: /Past 24 hours/i }).first();
-  if (await past24HoursFilter.count()) {
-    await past24HoursFilter.click();
+  if (!new URL(page.url()).pathname.startsWith('/jobs/search')) {
+    test.skip(true, 'LinkedIn redirected the guest search away from job results');
   }
 
   await page.waitForFunction(
@@ -86,22 +91,15 @@ async function main() {
 
   const csvLines = [
     'Post Date,Company,Job title,link',
-    ...rows.map(({ postDate, company, title, link }) => 
+    ...rows.map(({ postDate, company, title, link }) =>
       [escapeCsv(postDate), escapeCsv(company), escapeCsv(title), escapeCsv(link)].join(',')
     ),
   ];
 
   const csvContent = `${csvLines.join('\n')}\n`;
-  await fs.writeFile(reportPath, csvContent, 'utf8');
+  await writeCsvWithRetry(reportPath, csvContent);
 
   console.log('CSV report created:');
   console.log(csvContent);
   console.log(`\nReport saved to: ${reportPath}`);
-
-  await browser.close();
-}
-
-main().catch((error) => {
-  console.error('Test failed:', error);
-  process.exit(1);
 });
